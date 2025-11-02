@@ -8,7 +8,7 @@ import {
 } from '@nestjs/websockets';
 import { Server, Socket } from 'socket.io';
 import { ChatService } from './chat.service';
-import { firstValueFrom } from 'rxjs';
+import { Subject } from 'rxjs';
 
 @WebSocketGateway({
   cors: { origin: '*' },
@@ -17,23 +17,26 @@ export class ChatGateway implements OnGatewayInit {
   @WebSocketServer()
   server: Server;
 
-  private streams = new Map<string, any>(); // clientId -> { input$, stream$ }
+  private input$: Subject<any>; // stream input yang dikaitkan ke gRPC
+  private stream$: any;
 
   constructor(private readonly chatService: ChatService) {}
 
-  afterInit() {
-    console.log('✅ WebSocket Gateway initialized');
-  }
+  async afterInit() {
+    console.log('🟡 Initializing WebSocket Gateway...');
+    await this.chatService.ensureReady();
 
-  handleConnection(client: Socket) {
-    console.log(`🟢 Client connected: ${client.id}`);
-
+    console.log('🟢 gRPC service ready, opening stream...');
     const { input$, stream$ } = this.chatService.createStream();
 
-    // listen messages dari backend stream
+    // Simpan supaya bisa dipakai di handleSendMessage()
+    this.input$ = input$;
+    this.stream$ = stream$;
+
+    // Listen dari backend (gRPC streaming)
     stream$.subscribe({
       next: (msg) => {
-        // broadcast ke room yg sesuai aja
+        console.log('📥 From backend:', msg);
         if (msg.room_id) {
           this.server.to(msg.room_id).emit('chat_message', msg);
         } else {
@@ -44,14 +47,15 @@ export class ChatGateway implements OnGatewayInit {
       complete: () => console.log('Stream completed'),
     });
 
-    this.streams.set(client.id, { input$, stream$ });
+    console.log('✅ Chat stream aktif');
+  }
+
+  handleConnection(client: Socket) {
+    console.log(`🟢 Client connected: ${client.id}`);
   }
 
   handleDisconnect(client: Socket) {
     console.log(`🔴 Client disconnected: ${client.id}`);
-    const s = this.streams.get(client.id);
-    s?.stream$?.end?.();
-    this.streams.delete(client.id);
   }
 
   // 🏠 join room
@@ -71,18 +75,12 @@ export class ChatGateway implements OnGatewayInit {
     @ConnectedSocket() client: Socket,
     @MessageBody() data: { room_id: string; sender: string; content: string },
   ) {
-    const msg = {
-      room_id: data.room_id,
-      sender: data.sender,
-      content: data.content,
-    };
+  try {
+    // broadcast juga ke semua socket client lain
+    this.server.emit('chat_message', data);
 
-    // kirim ke Go backend
-    await firstValueFrom(this.chatService.sendMessage(msg));
-
-    // broadcast ke room (bukan global)
-    this.server.to(data.room_id).emit('chat_message', msg);
-
-    console.log(`[${data.room_id}] ${data.sender}: ${data.content}`);
+  } catch (err) {
+    console.error('gRPC error:', err);
+  }
   }
 }
